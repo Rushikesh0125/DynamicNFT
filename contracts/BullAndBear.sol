@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.18;
+pragma solidity ^0.8.0;
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
 import "@chainlink/contracts/src/v0.8/KeeperCompatible.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 
 
 contract BullAndBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable, KeeperCompatible {
     using Counters for Counters.Counter;
+
+    VRFCoordinatorV2Interface public COORDINATOR;
+    uint256[] public s_randomWords;
+    uint256 public s_requestId;
+    uint32 public callbackGasLimit = 500000; 
+    uint64 public s_subscriptionId;
+    bytes32 keyhash =  0xff8dedfbfa60af186cf3c830acbc32c05aae823045ae5ea7da1e45fbfaba4f92; 
 
     Counters.Counter private _tokenIdCounter;
     uint public interval;
@@ -19,11 +29,19 @@ contract BullAndBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable, Kee
     AggregatorV3Interface public priceFeed;
     int256 currentPrice;
 
-    constructor(uint256 updatedInterval, address _priceFeed) ERC721("BullAndBear", "BAB") {
+    enum MarketTrend{BULL, BEAR} 
+    MarketTrend public currentMarketTrend = MarketTrend.BULL; 
+
+    event TokenUpdated(
+        string trend
+    );
+
+    constructor(uint256 updatedInterval, address _priceFeed, address _vrfCoordinator) ERC721("BullAndBear", "BAB") VRFConsumerBaseV2(_vrfCoordinator) {
         interval = updatedInterval;
         lastTimeStamp = block.timestamp;
         priceFeed = AggregatorV3Interface(_priceFeed);
         currentPrice = getLatestPrice(); 
+        COORDINATOR = VRFCoordinatorV2Interface(_vrfCoordinator);  
     }
 
     string [] BullUris = [
@@ -42,36 +60,62 @@ contract BullAndBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable, Kee
         uint256 tokenId = _tokenIdCounter.current();
         _tokenIdCounter.increment();
         _safeMint(to, tokenId);
-        string defaultURI = BearUris[0];
+        string memory defaultURI = BearUris[0];
         _setTokenURI(tokenId, defaultURI);
     }
 
-    function checkUpKeep(bytes calldata) external view override returns(bool upKeepNeeded, bytes memory){
-        upKeepNeeded = (block.timestamp - lastTimeStamp) > interval;
+    function checkUpkeep(bytes calldata /* checkData */) external view override returns (bool upkeepNeeded, bytes memory /*performData */) {
+         upkeepNeeded = (block.timestamp - lastTimeStamp) > interval;
     }
 
-    function performUpKeep(bytes calldata) external override{
-        if((block.timestamp - lastTimeStamp) > interval){
-            lastTimeStamp = block.timestamp;
-            int256 latestPrice = getLatestPrice();
-            if(latestPrice == currentPrice){
+    function performUpkeep(bytes calldata /* performData */ ) external{
+        //We highly recommend revalidating the upkeep in the performUpkeep function
+        if ((block.timestamp - lastTimeStamp) > interval ) {
+            lastTimeStamp = block.timestamp;         
+            int latestPrice =  getLatestPrice();
+        
+            if (latestPrice == currentPrice) {
                 return;
             }
-            if(latestPrice < currentPrice){
+
+            if (latestPrice < currentPrice) {
+                // bear
                 updateAllTokenUri("bear");
-            }else{
+
+            } else {
+                // bull
                 updateAllTokenUri("bull");
             }
 
+            // update currentPrice
             currentPrice = latestPrice;
+        } else {
 
+            return;
         }
+
+       
     }
 
-    function getLatestPrice() public view returns(int256){
-        (int256 price) = priceFeed.latestRoundData();
 
-        return price;
+     function getLatestPrice() public view returns (int256) {
+         (
+            /*uint80 roundID*/,
+            int price,
+            /*uint startedAt*/,
+            /*uint timeStamp*/,
+            /*uint80 answeredInRound*/
+        ) = priceFeed.latestRoundData();
+
+        return price; //  example price returned 3034715771688
+    }
+
+    function setInterval(uint256 newInterval) public onlyOwner{
+        interval = newInterval;
+    }
+
+    function setPriceFeed(address newFeed) public onlyOwner{
+        priceFeed = AggregatorV3Interface(newFeed);
     }
 
     function updateAllTokenUri(string memory trend) internal{
@@ -84,7 +128,38 @@ contract BullAndBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable, Kee
                 _setTokenURI(i, BearUris[0]);
             }
         }
+
+        emit TokenUpdated(trend);
     }
+
+    function requestRandomnessForNFTUris() internal {
+        require(s_subscriptionId != 0, "Subscription ID not set"); 
+
+        // Will revert if subscription is not set and funded.
+        s_requestId = COORDINATOR.requestRandomWords(
+            keyhash,
+            s_subscriptionId, // See https://vrf.chain.link/
+            3, //minimum confirmations before response
+            callbackGasLimit,
+            1 
+        );
+
+    }
+
+    function fulfillRandomWords( uint256, uint256[] memory randomWords) internal {
+    s_randomWords = randomWords;
+
+    string[] memory urisForTrend = currentMarketTrend == MarketTrend.BULL ? BullUris : BearUris;
+    uint256 idx = randomWords[0] % urisForTrend.length; 
+
+    for (uint i = 0; i < _tokenIdCounter.current() ; i++) {
+        _setTokenURI(i, urisForTrend[idx]);
+    } 
+
+    string memory trend = currentMarketTrend == MarketTrend.BULL ? "bullish" : "bearish";
+    
+    emit TokenUpdated(trend);
+  }
 
     function compareStrings(string memory a, string memory b) internal returns(bool){
         return (keccak256(abi.encodePacked(a)) == keccak256(abi.encodePacked(b)));
